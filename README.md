@@ -1,21 +1,23 @@
-# SDN Project - Topology Change Detector
+# SDN Project - Topology Viewer and Network Controller
 
-A simple OpenFlow controller that detects network topology changes.
+An OpenFlow 1.3 controller that implements a self-healing network with topology change detection and L2 switching capabilities.
 
-## Requirements
+## Features
 
-- **Monitor switch/link events**: Track switch connections and disconnections
-- **Update topology map**: Maintain current network topology
-- **Display changes**: Log and show topology changes in real-time
-- **Log updates**: Write topology changes to log file
+- **L2 Switching**: MAC address learning with flow-based forwarding
+- **Topology Change Detection**: Monitors switch/link join and leave events using OS Ken's topology API
+- **Self-Healing**: Automatically flushes flow tables when topology changes to force re-learning
+- **ARP Storm Mitigation**: Prevents broadcast storms from ARP requests
+- **Real-time Visualization**: Generates network topology graph using NetworkX/Matplotlib
 
-## Structure
+## Architecture
 
 ```
 SDNProject/
-├── controller.py      # OpenFlow controller with topology detection
-├── topology.py      # Mininet topologies
-└── README.md
+├── controller.py      # OpenFlow controller with topology detection & L2 switching
+├── topology.py      # Mininet topology definitions
+├── README.md        # This file
+└── network_topology.png   # Generated topology visualization
 ```
 
 ## Quick Start
@@ -33,22 +35,41 @@ sudo mn --switch ovs --controller remote --custom topology.py --topo single
 Available topologies:
 - `single` - 1 switch, 2 hosts
 - `triangle` - 3 switches, 2 hosts (for link failure testing)
+- `hierarchical` - 3 switches, 4 hosts in tree layout
 
 ## How It Works
 
-1. **Controller** (`controller.py`):
-   - Tracks switches via `EventOFPSwitchFeatures`
-   - Monitors link changes via topology API
-   - Logs all changes to `topology_changes.log`
+### 1. L2 Switching Logic
+The controller learns MAC addresses from incoming packets and installs flow rules for efficient forwarding:
 
-2. **Topology** (`topology.py`):
-   - Creates Mininet topology
-   - Connects to remote controller at `127.0.0.1:6653`
+- Unknown destinations → Flood
+- Known destinations → Install flow and forward to specific port
+
+### 2. Topology Change Detection
+The controller listens for OS Ken topology events:
+- `EventSwitchEnter` / `EventSwitchLeave` - Switch connections
+- `EventLinkAdd` / `EventLinkDelete` - Link changes
+- `EventHostAdd` - New host detection
+
+### 3. Self-Healing Mechanism
+When topology changes detected:
+1. Clear MAC address tables
+2. Clear ARP history
+3. Delete all flow rules from switches
+4. Re-install table-miss rules
+
+This forces the network to re-learn paths, preventing forwarding loops and blackholes.
+
+### 4. ARP Storm Mitigation
+Tracks ARP requests using signature `(switch_id, src_mac, src_ip, dst_ip)`. Drops duplicates within 5 seconds.
+
+### 5. Visualization
+The controller uses NetworkX to build a graph representation of the network and renders it to `network_topology.png` on each topology change.
 
 ## Port Configuration
 
-- Default OpenFlow port: **6653**
-- Controller listens on `127.0.0.1:6653`
+- **OpenFlow Port**: 6653
+- **Controller Listen Address**: 127.0.0.1:6653
 
 ## Testing
 
@@ -58,7 +79,7 @@ mininet> h1 ping h2
 mininet> nodes
 mininet> net
 
-# To test link failure detection (triangle topo)
+# Test link failure detection (triangle topo)
 mininet> link s1 s2 down
 mininet> pingall
 mininet> link s1 s2 up
