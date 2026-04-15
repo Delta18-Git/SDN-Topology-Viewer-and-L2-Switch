@@ -4,7 +4,6 @@ import time
 import matplotlib
 import networkx as nx
 
-# Use 'Agg' backend to safely generate plots in non-main threads
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from eventlet.semaphore import Semaphore
@@ -25,31 +24,70 @@ class TopologyChangeDetector(app_manager.OSKenApp):
 
         self.net = nx.Graph()
         self.mac_to_port = {}
-
-        # Dictionary to track recent ARP broadcasts to prevent Broadcast Storms
         self.arp_history = {}
+
+        # Track active switch connections so we can send flow-delete commands to them
+        self.datapaths = {}
 
         self.logger.setLevel(logging.INFO)
         self.draw_lock = Semaphore()
 
-        self.logger.info(
-            "Topology API Detector & Storm-Resistant L2 Switch Initialized."
-        )
+        self.logger.info("Self-Healing Topology Detector & L2 Switch Initialized.")
 
     # =============================================
-    # LAYER 2 SWITCHING LOGIC (With Storm Mitigation)
+    # LAYER 2 SWITCHING LOGIC & SELF-HEALING
     # =============================================
-    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
-    def switch_features_handler(self, ev):
-        datapath = ev.msg.datapath
+    def _add_table_miss(self, datapath):
+        """Installs the default rule to send unknown packets to the controller."""
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
         match = parser.OFPMatch()
         actions = [
             parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)
         ]
         self.add_flow(datapath, 0, match, actions)
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+        datapath = ev.msg.datapath
+        # Register the switch
+        self.datapaths[datapath.id] = datapath
+        self._add_table_miss(datapath)
+
+    def flush_network_state(self):
+        """
+        Forces the network to 'forget' old paths and re-learn everything.
+        Called when a link goes down/up or a switch joins/leaves.
+        """
+        self.logger.warning(
+            "[!] Topology altered! Flushing MAC tables and flows to force re-learning..."
+        )
+
+        # Clear internal memory
+        self.mac_to_port.clear()
+        self.arp_history.clear()
+
+        # Wipe flow tables on all active switches
+        for dp in self.datapaths.values():
+            try:
+                ofproto = dp.ofproto
+                parser = dp.ofproto_parser
+                match = parser.OFPMatch()
+
+                # OFPFC_DELETE with an empty match deletes ALL flows on the switch
+                mod = parser.OFPFlowMod(
+                    datapath=dp,
+                    command=ofproto.OFPFC_DELETE,
+                    out_port=ofproto.OFPP_ANY,
+                    out_group=ofproto.OFPG_ANY,
+                    match=match,
+                )
+                dp.send_msg(mod)
+
+                # Re-add the Table-Miss flow immediately so we don't go completely deaf
+                self._add_table_miss(dp)
+            except Exception as e:
+                self.logger.error(f"Failed to flush flows on switch {dp.id}: {e}")
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
@@ -81,26 +119,21 @@ class TopologyChangeDetector(app_manager.OSKenApp):
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
 
-        # Ignore LLDP and IPv6 Multicast (Keeps topology clean)
         if eth.ethertype in [ether_types.ETH_TYPE_LLDP, ether_types.ETH_TYPE_IPV6]:
             return
 
-        # --- BROADCAST STORM MITIGATION (Loop Prevention) ---
+        # Broadcast Storm Mitigation
         if eth.dst == "ff:ff:ff:ff:ff:ff" and eth.ethertype == ether_types.ETH_TYPE_ARP:
             arp_pkts = pkt.get_protocols(arp.arp)
             if arp_pkts:
                 arp_pkt = arp_pkts[0]
-                # Create a unique signature for this specific ARP request on this specific switch
                 sig = (datapath.id, arp_pkt.src_mac, arp_pkt.src_ip, arp_pkt.dst_ip)
                 current_time = time.time()
-
-                # If this switch has already flooded this exact ARP in the last 5 seconds, drop it!
                 if sig in self.arp_history and (
                     current_time - self.arp_history[sig] < 5
                 ):
                     return
                 self.arp_history[sig] = current_time
-        # ----------------------------------------------------
 
         dst = eth.dst
         src = eth.src
@@ -144,11 +177,17 @@ class TopologyChangeDetector(app_manager.OSKenApp):
     def switch_enter_handler(self, ev):
         self.logger.info(f"[EVENT] Switch Entered: s{ev.switch.dp.id}")
         self.update_topology_graph()
+        self.flush_network_state()
 
     @set_ev_cls(event.EventSwitchLeave)
     def switch_leave_handler(self, ev):
-        self.logger.info(f"[EVENT] Switch Left: s{ev.switch.dp.id}")
+        dpid = ev.switch.dp.id
+        self.logger.info(f"[EVENT] Switch Left: s{dpid}")
+        # Remove from active datapaths tracker
+        if dpid in self.datapaths:
+            del self.datapaths[dpid]
         self.update_topology_graph()
+        self.flush_network_state()
 
     @set_ev_cls(event.EventLinkAdd)
     def link_add_handler(self, ev):
@@ -156,6 +195,7 @@ class TopologyChangeDetector(app_manager.OSKenApp):
             f"[EVENT] Link Added: s{ev.link.src.dpid} <---> s{ev.link.dst.dpid}"
         )
         self.update_topology_graph()
+        self.flush_network_state()
 
     @set_ev_cls(event.EventLinkDelete)
     def link_delete_handler(self, ev):
@@ -163,6 +203,7 @@ class TopologyChangeDetector(app_manager.OSKenApp):
             f"[EVENT] Link Deleted: s{ev.link.src.dpid} </-> s{ev.link.dst.dpid}"
         )
         self.update_topology_graph()
+        self.flush_network_state()
 
     @set_ev_cls(event.EventHostAdd)
     def host_add_handler(self, ev):
@@ -257,7 +298,7 @@ class TopologyChangeDetector(app_manager.OSKenApp):
             font_color="black",
         )
 
-        plt.title("Dynamic Network Topology (Storm Resistant)", fontsize=16)
+        plt.title("Self-Healing Network Topology", fontsize=16)
         plt.axis("off")
 
         filename = "network_topology.png"
