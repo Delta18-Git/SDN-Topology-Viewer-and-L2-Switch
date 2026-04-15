@@ -32,11 +32,9 @@ class TopologyChangeDetector(app_manager.OSKenApp):
         self.logger.setLevel(logging.INFO)
         self.draw_lock = Semaphore()
 
-        self.logger.info("Self-Healing Topology Detector & L2 Switch Initialized.")
+        self.logger.info("Topology Detector & L2 Switch Initialized")
 
-    # =============================================
-    # LAYER 2 SWITCHING LOGIC & SELF-HEALING
-    # =============================================
+    # LAYER 2 SWITCHING LOGIC
     def _add_table_miss(self, datapath):
         """Installs the default rule to send unknown packets to the controller."""
         ofproto = datapath.ofproto
@@ -59,9 +57,7 @@ class TopologyChangeDetector(app_manager.OSKenApp):
         Forces the network to 'forget' old paths and re-learn everything.
         Called when a link goes down/up or a switch joins/leaves.
         """
-        self.logger.warning(
-            "[!] Topology altered! Flushing MAC tables and flows to force re-learning..."
-        )
+        self.logger.warning("[!] Topology altered! Flushing MAC tables and flows")
 
         # Clear internal memory
         self.mac_to_port.clear()
@@ -170,9 +166,7 @@ class TopologyChangeDetector(app_manager.OSKenApp):
         )
         datapath.send_msg(out)
 
-    # =============================================
     # TOPOLOGY DISCOVERY TRIGGERS
-    # =============================================
     @set_ev_cls(event.EventSwitchEnter)
     def switch_enter_handler(self, ev):
         self.logger.info(f"[EVENT] Switch Entered: s{ev.switch.dp.id}")
@@ -210,9 +204,7 @@ class TopologyChangeDetector(app_manager.OSKenApp):
         self.logger.info(f"[EVENT] Host Detected: {ev.host.mac}")
         self.update_topology_graph()
 
-    # =============================================
-    # API FETCHING & VISUALIZATION LOGIC
-    # =============================================
+    # VISUALIZATION LOGIC
     def update_topology_graph(self):
         with self.draw_lock:
             try:
