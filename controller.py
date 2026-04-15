@@ -1,4 +1,5 @@
 import logging
+import time
 
 import matplotlib
 import networkx as nx
@@ -10,7 +11,7 @@ from eventlet.semaphore import Semaphore
 from os_ken.base import app_manager
 from os_ken.controller import ofp_event
 from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
-from os_ken.lib.packet import ether_types, ethernet, packet
+from os_ken.lib.packet import arp, ether_types, ethernet, packet
 from os_ken.ofproto import ofproto_v1_3
 from os_ken.topology import event
 from os_ken.topology.api import get_host, get_link, get_switch
@@ -24,13 +25,19 @@ class TopologyChangeDetector(app_manager.OSKenApp):
 
         self.net = nx.Graph()
         self.mac_to_port = {}
+
+        # Dictionary to track recent ARP broadcasts to prevent Broadcast Storms
+        self.arp_history = {}
+
         self.logger.setLevel(logging.INFO)
         self.draw_lock = Semaphore()
 
-        self.logger.info("Topology API Detector & L2 Switch Initialized.")
+        self.logger.info(
+            "Topology API Detector & Storm-Resistant L2 Switch Initialized."
+        )
 
     # =============================================
-    # LAYER 2 SWITCHING LOGIC (Allows Ping)
+    # LAYER 2 SWITCHING LOGIC (With Storm Mitigation)
     # =============================================
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -74,9 +81,26 @@ class TopologyChangeDetector(app_manager.OSKenApp):
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
 
-        # Ignore LLDP
-        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
+        # Ignore LLDP and IPv6 Multicast (Keeps topology clean)
+        if eth.ethertype in [ether_types.ETH_TYPE_LLDP, ether_types.ETH_TYPE_IPV6]:
             return
+
+        # --- BROADCAST STORM MITIGATION (Loop Prevention) ---
+        if eth.dst == "ff:ff:ff:ff:ff:ff" and eth.ethertype == ether_types.ETH_TYPE_ARP:
+            arp_pkts = pkt.get_protocols(arp.arp)
+            if arp_pkts:
+                arp_pkt = arp_pkts[0]
+                # Create a unique signature for this specific ARP request on this specific switch
+                sig = (datapath.id, arp_pkt.src_mac, arp_pkt.src_ip, arp_pkt.dst_ip)
+                current_time = time.time()
+
+                # If this switch has already flooded this exact ARP in the last 5 seconds, drop it!
+                if sig in self.arp_history and (
+                    current_time - self.arp_history[sig] < 5
+                ):
+                    return
+                self.arp_history[sig] = current_time
+        # ----------------------------------------------------
 
         dst = eth.dst
         src = eth.src
@@ -116,7 +140,6 @@ class TopologyChangeDetector(app_manager.OSKenApp):
     # =============================================
     # TOPOLOGY DISCOVERY TRIGGERS
     # =============================================
-    # Whenever a network topology event occurs, trigger a full map refresh
     @set_ev_cls(event.EventSwitchEnter)
     def switch_enter_handler(self, ev):
         self.logger.info(f"[EVENT] Switch Entered: s{ev.switch.dp.id}")
@@ -150,41 +173,28 @@ class TopologyChangeDetector(app_manager.OSKenApp):
     # API FETCHING & VISUALIZATION LOGIC
     # =============================================
     def update_topology_graph(self):
-        """
-        Rebuild the topology graph directly from OSKen's API.
-        """
         with self.draw_lock:
             try:
-                # 1. Clear the old graph state completely
                 self.net.clear()
 
-                # 2. Fetch the latest live data from OSKen Topology APIs
                 switches = get_switch(self)
                 links = get_link(self)
                 hosts = get_host(self)
 
-                # Keep a register of what switch ports are connecting switches together
                 switch_interconnect_ports = set()
 
-                # --- Map Switches ---
                 for s in switches:
                     self.net.add_node(f"s{s.dp.id}", type="switch")
 
-                # --- Map Links ---
                 for link in links:
                     src_id = f"s{link.src.dpid}"
                     dst_id = f"s{link.dst.dpid}"
                     self.net.add_edge(src_id, dst_id)
 
-                    # Log the exact ports being used for switch-to-switch links
                     switch_interconnect_ports.add((link.src.dpid, link.src.port_no))
                     switch_interconnect_ports.add((link.dst.dpid, link.dst.port_no))
 
-                # --- Map Hosts ---
                 for h in hosts:
-                    # LOGICAL FILTER: If a host is supposedly connected to a port that
-                    # we know is an inter-switch link, it's a Linux veth DAD/IPv6
-                    # ghost packet. Ignore it entirely.
                     if (h.port.dpid, h.port.port_no) in switch_interconnect_ports:
                         continue
 
@@ -193,7 +203,6 @@ class TopologyChangeDetector(app_manager.OSKenApp):
                     self.net.add_node(mac, type="host")
                     self.net.add_edge(mac, switch_id)
 
-                # 3. Draw and save the new Map
                 self.render_graph()
 
             except Exception as e:
@@ -248,11 +257,9 @@ class TopologyChangeDetector(app_manager.OSKenApp):
             font_color="black",
         )
 
-        plt.title("Dynamic Network Topology (OSKen API)", fontsize=16)
+        plt.title("Dynamic Network Topology (Storm Resistant)", fontsize=16)
         plt.axis("off")
 
         filename = "network_topology.png"
         plt.savefig(filename, bbox_inches="tight")
         plt.close()
-
-        self.logger.info(f"[*] Map Rebuilt & Saved to {filename}")
