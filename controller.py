@@ -290,7 +290,7 @@ class TopologyChangeDetector(app_manager.OSKenApp):
             font_color="black",
         )
 
-        plt.title("Self-Healing Network Topology", fontsize=16)
+        plt.title("Network Topology", fontsize=16)
         plt.axis("off")
 
         filename = "network_topology.png"

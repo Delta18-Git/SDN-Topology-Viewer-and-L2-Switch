@@ -20,9 +20,9 @@ class HierarchicalTopo(Topo):
               h1   h2
                \\   /
                 s1
-               /  \
+               /  \\
              s2    s3
-            /       \
+            /       \\
           h3        h4
     """
 
@@ -50,7 +50,7 @@ class TriangleTopo(Topo):
 
     Topology:
         h1 --- s1 --- s2 --- h2
-                \     /
+                \\   /
                  s3
     """
 
